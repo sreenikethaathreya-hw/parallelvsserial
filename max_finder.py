@@ -90,6 +90,154 @@ class IOWaitMonitor:
         }
 
 
+class DiskIOQueueMonitor:
+    """
+    Monitor disk I/O queue statistics.
+    
+    Tracks:
+    - Read time: Total time spent on read operations (includes queue wait)
+    - Read count: Number of read operations
+    - Average read latency: Average time per read operation
+    - Queue wait time estimate: Based on read time vs actual data transfer time
+    """
+    
+    def __init__(self, interval: float = 0.5):
+        self.interval = interval
+        self.running = False
+        self.thread: Optional[threading.Thread] = None
+        self.samples: list = []
+        self.disk_start = None
+        self.disk_end = None
+        self.start_time = 0.0
+        
+    def start(self):
+        self.running = True
+        self.samples = []
+        self.start_time = time.time()
+        
+        # Get initial disk I/O counters
+        try:
+            self.disk_start = psutil.disk_io_counters()
+        except Exception:
+            self.disk_start = None
+        
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread.start()
+    
+    def stop(self):
+        self.running = False
+        
+        # Get final disk I/O counters
+        try:
+            self.disk_end = psutil.disk_io_counters()
+        except Exception:
+            self.disk_end = None
+            
+        if self.thread:
+            self.thread.join(timeout=2.0)
+    
+    def _monitor_loop(self):
+        last_counters = self.disk_start
+        last_time = time.time()
+        
+        while self.running:
+            time.sleep(self.interval)
+            
+            try:
+                current_counters = psutil.disk_io_counters()
+                current_time = time.time()
+                
+                if last_counters and current_counters:
+                    delta_time = current_time - last_time
+                    
+                    # Calculate delta values
+                    delta_read_count = current_counters.read_count - last_counters.read_count
+                    delta_read_bytes = current_counters.read_bytes - last_counters.read_bytes
+                    delta_read_time = current_counters.read_time - last_counters.read_time  # in milliseconds
+                    
+                    # Calculate metrics
+                    if delta_read_count > 0:
+                        avg_read_latency_ms = delta_read_time / delta_read_count
+                    else:
+                        avg_read_latency_ms = 0
+                    
+                    # Estimate queue wait time
+                    # Theoretical transfer time = bytes / (SSD speed ~3GB/s)
+                    theoretical_transfer_time_ms = (delta_read_bytes / (3 * 1024 * 1024 * 1024)) * 1000
+                    queue_wait_ms = max(0, delta_read_time - theoretical_transfer_time_ms)
+                    
+                    self.samples.append({
+                        'timestamp': current_time,
+                        'read_count': delta_read_count,
+                        'read_bytes': delta_read_bytes,
+                        'read_time_ms': delta_read_time,
+                        'avg_latency_ms': avg_read_latency_ms,
+                        'queue_wait_ms': queue_wait_ms,
+                        'iops': delta_read_count / delta_time if delta_time > 0 else 0
+                    })
+                
+                last_counters = current_counters
+                last_time = current_time
+                
+            except Exception:
+                pass
+    
+    def get_summary(self) -> dict:
+        if not self.disk_start or not self.disk_end:
+            return {
+                'total_read_ops': 0,
+                'total_read_time_ms': 0,
+                'avg_read_latency_ms': 0,
+                'queue_wait_time_ms': 0,
+                'queue_wait_pct': 0,
+                'avg_iops': 0
+            }
+        
+        # Calculate totals from start to end
+        total_read_ops = self.disk_end.read_count - self.disk_start.read_count
+        total_read_bytes = self.disk_end.read_bytes - self.disk_start.read_bytes
+        total_read_time_ms = self.disk_end.read_time - self.disk_start.read_time
+        elapsed_time = time.time() - self.start_time
+        
+        # Average latency per operation
+        avg_latency_ms = total_read_time_ms / total_read_ops if total_read_ops > 0 else 0
+        
+        # Estimate queue wait time
+        # Theoretical transfer time at ~3GB/s SSD speed
+        theoretical_transfer_ms = (total_read_bytes / (3 * 1024 * 1024 * 1024)) * 1000
+        queue_wait_ms = max(0, total_read_time_ms - theoretical_transfer_ms)
+        queue_wait_pct = (queue_wait_ms / total_read_time_ms * 100) if total_read_time_ms > 0 else 0
+        
+        # IOPS
+        avg_iops = total_read_ops / elapsed_time if elapsed_time > 0 else 0
+        
+        # Get sample-based averages
+        if self.samples:
+            sample_avg_latency = sum(s['avg_latency_ms'] for s in self.samples) / len(self.samples)
+            sample_avg_queue_wait = sum(s['queue_wait_ms'] for s in self.samples) / len(self.samples)
+            peak_latency = max(s['avg_latency_ms'] for s in self.samples)
+            peak_iops = max(s['iops'] for s in self.samples)
+        else:
+            sample_avg_latency = avg_latency_ms
+            sample_avg_queue_wait = queue_wait_ms
+            peak_latency = avg_latency_ms
+            peak_iops = avg_iops
+        
+        return {
+            'total_read_ops': total_read_ops,
+            'total_read_time_ms': total_read_time_ms,
+            'avg_read_latency_ms': avg_latency_ms,
+            'sample_avg_latency_ms': sample_avg_latency,
+            'peak_latency_ms': peak_latency,
+            'queue_wait_time_ms': queue_wait_ms,
+            'sample_avg_queue_wait_ms': sample_avg_queue_wait,
+            'queue_wait_pct': queue_wait_pct,
+            'avg_iops': avg_iops,
+            'peak_iops': peak_iops,
+            'total_read_bytes': total_read_bytes
+        }
+
+
 class CPUMonitor:
     """Monitor CPU utilization per core with on-CPU/off-CPU time tracking."""
     
@@ -388,6 +536,19 @@ def print_tabulated_results(results: dict):
     print(f"{'I/O Wait Percentage':<40} {io['io_wait_pct']:>32.1f} %")
     print(f"{'CPU Busy Percentage':<40} {io['cpu_busy_pct']:>32.1f} %")
     
+    # Disk I/O Queue Statistics
+    if 'disk_io' in results and results['disk_io']['total_read_ops'] > 0:
+        dio = results['disk_io']
+        print(f"\n{'--- DISK I/O QUEUE STATISTICS ---':<40}")
+        print(f"{'Total Read Operations':<40} {dio['total_read_ops']:>35,}")
+        print(f"{'Total Disk Read Time':<40} {dio['total_read_time_ms']:>32.2f} ms")
+        print(f"{'Average Read Latency':<40} {dio['avg_read_latency_ms']:>32.3f} ms")
+        print(f"{'Peak Read Latency':<40} {dio['peak_latency_ms']:>32.3f} ms")
+        print(f"{'Queue Wait Time (estimated)':<40} {dio['queue_wait_time_ms']:>32.2f} ms")
+        print(f"{'Queue Wait Percentage':<40} {dio['queue_wait_pct']:>32.1f} %")
+        print(f"{'Average IOPS':<40} {dio['avg_iops']:>32.0f}")
+        print(f"{'Peak IOPS':<40} {dio['peak_iops']:>32.0f}")
+    
     print(f"\n{'--- CPU CORES ---':<40}")
     cpu = results['cpu']
     print(f"{'Total Logical Cores':<40} {cpu['total_cores']:>35}")
@@ -493,11 +654,13 @@ def run_benchmark(filepath: str, num_threads: int = 1,
     cpu_monitor = CPUMonitor(interval=0.5)
     throughput_monitor = ThroughputMonitor(stats, interval=1.0)
     io_wait_monitor = IOWaitMonitor()
+    disk_io_monitor = DiskIOQueueMonitor(interval=0.5)
     
     # Start monitors
     cpu_monitor.start()
     throughput_monitor.start()
     io_wait_monitor.start()
+    disk_io_monitor.start()
     
     start_time = time.time()
     
@@ -509,6 +672,7 @@ def run_benchmark(filepath: str, num_threads: int = 1,
     finally:
         throughput_monitor.stop()
         cpu_monitor.stop()
+        disk_io_monitor.stop()
     
     end_time = time.time()
     elapsed = end_time - start_time
@@ -517,6 +681,7 @@ def run_benchmark(filepath: str, num_threads: int = 1,
     cpu_summary = cpu_monitor.get_summary()
     throughput_summary = throughput_monitor.get_summary()
     io_stats = io_wait_monitor.get_stats()
+    disk_io_stats = disk_io_monitor.get_summary()
     
     results = {
         'max_value': max_val,
@@ -524,6 +689,7 @@ def run_benchmark(filepath: str, num_threads: int = 1,
         'throughput': throughput_summary,
         'cpu': cpu_summary,
         'io_stats': io_stats,
+        'disk_io': disk_io_stats,
         'file_size': file_size,
         'num_threads': num_threads
     }

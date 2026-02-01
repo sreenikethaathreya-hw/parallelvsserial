@@ -27,6 +27,8 @@ public class MaxFinder {
     
     // Shared statistics
     private static final AtomicLong bytesRead = new AtomicLong(0);
+    private static final AtomicLong readOperations = new AtomicLong(0);
+    private static final AtomicLong totalReadTimeNs = new AtomicLong(0);
     private static volatile boolean monitoringActive = false;
     
     // Results storage
@@ -110,6 +112,8 @@ public class MaxFinder {
         
         // Reset counters
         bytesRead.set(0);
+        readOperations.set(0);
+        totalReadTimeNs.set(0);
         monitoringActive = true;
         
         // Get MXBeans for monitoring
@@ -184,6 +188,16 @@ public class MaxFinder {
         if (minThroughput == Double.MAX_VALUE) minThroughput = 0;
         double overallThroughput = (bytesRead.get() / (1024.0 * 1024.0)) / wallTime;
         
+        // Calculate I/O queue statistics
+        long totalReadOps = readOperations.get();
+        double totalReadTimeMs = totalReadTimeNs.get() / 1_000_000.0;
+        double avgLatencyMs = totalReadOps > 0 ? totalReadTimeMs / totalReadOps : 0;
+        
+        // Estimate queue wait time: total read time - theoretical transfer time
+        // Assuming SSD can transfer at ~3GB/s
+        double theoreticalTransferMs = (bytesRead.get() / (3.0 * 1024 * 1024 * 1024)) * 1000;
+        double queueWaitMs = Math.max(0, totalReadTimeMs - theoreticalTransferMs);
+        
         // Store results
         benchmarkResults.clear();
         benchmarkResults.put("timestamp", LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
@@ -203,13 +217,17 @@ public class MaxFinder {
         benchmarkResults.put("cpu_busy_pct", cpuBusyPct);
         benchmarkResults.put("total_cores", availableProcessors);
         benchmarkResults.put("overall_throughput_mbps", overallThroughput);
+        benchmarkResults.put("total_read_ops", totalReadOps);
+        benchmarkResults.put("total_read_time_ms", totalReadTimeMs);
+        benchmarkResults.put("avg_latency_ms", avgLatencyMs);
+        benchmarkResults.put("queue_wait_ms", queueWaitMs);
         
         // Print tabulated results
         printTabulatedResults(fileSize, numThreads, maxValue, wallTime,
                              avgThroughput > 0 ? avgThroughput : overallThroughput,
                              peakThroughput, minThroughput, overallThroughput,
                              cpuTime, userTime, systemTime, ioWaitTime, ioWaitPct, cpuBusyPct,
-                             availableProcessors);
+                             availableProcessors, totalReadOps, totalReadTimeMs, avgLatencyMs, queueWaitMs);
         
         // Save to CSV if requested
         if (csvPath != null) {
@@ -269,7 +287,9 @@ public class MaxFinder {
                                                double overallThroughput, double cpuTime,
                                                double userTime, double systemTime,
                                                double ioWaitTime, double ioWaitPct,
-                                               double cpuBusyPct, int totalCores) {
+                                               double cpuBusyPct, int totalCores,
+                                               long totalReadOps, double totalReadTimeMs,
+                                               double avgLatencyMs, double queueWaitMs) {
         System.out.println("\n\n" + "=".repeat(80));
         System.out.printf("%40s%n", "BENCHMARK RESULTS SUMMARY");
         System.out.println("=".repeat(80));
@@ -295,6 +315,20 @@ public class MaxFinder {
         System.out.printf("%-40s %32.2f sec%n", "  System Time", systemTime);
         System.out.printf("%-40s %32.2f sec%n", "I/O Wait Time (estimated)", ioWaitTime);
         System.out.printf("%-40s %32.1f %%%n", "I/O Wait Percentage", ioWaitPct);
+        
+        // I/O Queue Statistics
+        if (totalReadOps > 0) {
+            double iops = totalReadOps / wallTime;
+            double queueWaitPct = (queueWaitMs / totalReadTimeMs) * 100;
+            
+            System.out.printf("%n%-40s%n", "--- DISK I/O QUEUE STATISTICS ---");
+            System.out.printf("%-40s %,35d%n", "Total Read Operations", totalReadOps);
+            System.out.printf("%-40s %32.2f ms%n", "Total Disk Read Time", totalReadTimeMs);
+            System.out.printf("%-40s %32.3f ms%n", "Average Read Latency", avgLatencyMs);
+            System.out.printf("%-40s %32.2f ms%n", "Queue Wait Time (estimated)", queueWaitMs);
+            System.out.printf("%-40s %32.1f %%%n", "Queue Wait Percentage", queueWaitPct);
+            System.out.printf("%-40s %32.0f%n", "Average IOPS", iops);
+        }
         System.out.printf("%-40s %32.1f %%%n", "CPU Busy Percentage", cpuBusyPct);
         
         System.out.printf("%n%-40s%n", "--- CPU CORES ---");
@@ -374,11 +408,18 @@ public class MaxFinder {
             
             while (true) {
                 buffer.clear();
+                
+                // Track I/O timing
+                long readStart = System.nanoTime();
                 int bytesReadCount = channel.read(buffer);
+                long readEnd = System.nanoTime();
                 
                 if (bytesReadCount <= 0) break;
                 
                 bytesRead.addAndGet(bytesReadCount);
+                readOperations.incrementAndGet();
+                totalReadTimeNs.addAndGet(readEnd - readStart);
+                
                 buffer.flip();
                 
                 int numDoubles = bytesReadCount / DOUBLE_SIZE;
@@ -453,10 +494,17 @@ public class MaxFinder {
                 int toRead = (int) Math.min(chunkSize, remaining);
                 buffer.limit(toRead);
                 
+                // Track I/O timing
+                long readStart = System.nanoTime();
                 int bytesReadCount = channel.read(buffer);
+                long readEnd = System.nanoTime();
+                
                 if (bytesReadCount <= 0) break;
                 
                 bytesRead.addAndGet(bytesReadCount);
+                readOperations.incrementAndGet();
+                totalReadTimeNs.addAndGet(readEnd - readStart);
+                
                 remaining -= bytesReadCount;
                 buffer.flip();
                 
